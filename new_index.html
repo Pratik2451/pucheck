@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PUCheck - Multi-Gas Emission Monitoring</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-slate-900 text-white min-h-screen">
+  <header class="p-6 text-center">
+    <h1 class="text-4xl font-bold">PUCheck</h1>
+    <p class="text-slate-400">Continuous Multi-Gas Vehicular Emission Monitoring</p>
+    <p id="connectionStatus" class="mt-3 text-sm text-amber-300">Connecting to Firebase...</p>
+  </header>
+
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-6 px-6 mb-6">
+    <div class="card"><h2>CO (ppm)</h2><p id="co">--</p></div>
+    <div class="card"><h2>Other Gases Index</h2><p id="other">--</p></div>
+    <div class="card"><h2>AQI (Calculated)</h2><p id="aqi">--</p></div>
+    <div class="bg-slate-800 rounded-2xl p-6 shadow-xl text-center col-span-1 md:col-span-3">
+      <h2 class="text-slate-400">Overall Compliance Status</h2>
+      <p id="status" class="text-3xl font-bold mt-6 text-amber-300">WAITING FOR SENSOR</p>
+    </div>
+  </section>
+
+  <section class="grid grid-cols-1 md:grid-cols-2 gap-6 px-6 mb-6">
+    <div class="bg-slate-800 p-6 rounded-2xl shadow-xl"><h2 class="text-xl mb-4">CO Trend</h2><canvas id="coChart"></canvas></div>
+    <div class="bg-slate-800 p-6 rounded-2xl shadow-xl"><h2 class="text-xl mb-4">Other Gases Trend</h2><canvas id="otherChart"></canvas></div>
+  </section>
+
+  <section class="bg-slate-800 m-6 p-6 rounded-2xl shadow-xl overflow-x-auto">
+    <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
+      <h2 class="text-xl">Violation Log</h2>
+      <span id="logStatus" class="text-sm text-slate-400">Loading saved logs...</span>
+    </div>
+    <table class="w-full min-w-[650px] text-left">
+      <thead><tr class="text-slate-400 border-b border-slate-700">
+        <th class="p-2">Time</th><th class="p-2">Parameter</th><th class="p-2">Value</th><th class="p-2">Status</th>
+      </tr></thead>
+      <tbody id="logTable"><tr><td class="p-2 text-slate-400" colspan="4">Loading logs...</td></tr></tbody>
+    </table>
+  </section>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+import { getFirestore, collection, addDoc, serverTimestamp, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+// PUCheck Firebase project configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyDm169OAPG3H-Dbrn4stTZUuvTK3BlE05o",
+  authDomain: "pucheck.firebaseapp.com",
+  databaseURL: "https://pucheck-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "pucheck",
+  storageBucket: "pucheck.firebasestorage.app",
+  messagingSenderId: "58362016367",
+  appId: "1:58362016367:web:c59052f41b535b0ae7939a",
+  measurementId: "G-GKEJN4465X"
+};
+
+const vehicleNumber = "MH12AB1234";
+const thresholds = { co: 1875, other: 400, aqi: 150 };
+
+const connectionStatus = document.getElementById("connectionStatus");
+const logStatus = document.getElementById("logStatus");
+const logTable = document.getElementById("logTable");
+
+function setConnectionMessage(message, color = "text-amber-300") {
+  connectionStatus.textContent = message;
+  connectionStatus.className = `mt-3 text-sm ${color}`;
+}
+
+function setWaiting(message) {
+  ["co", "other", "aqi"].forEach(id => {
+    const el = document.getElementById(id);
+    el.textContent = "--";
+    el.className = "text-4xl font-bold mt-4 text-slate-400";
+  });
+  const status = document.getElementById("status");
+  status.textContent = "WAITING FOR SENSOR";
+  status.className = "text-3xl font-bold mt-6 text-amber-300";
+  setConnectionMessage(message);
+}
+
+const history = { co: [], other: [], time: [] };
+
+function createChart(canvasId, label, key, color) {
+  return new Chart(document.getElementById(canvasId).getContext("2d"), {
+    type: "line",
+    data: { labels: history.time, datasets: [{
+      label, data: history[key], borderColor: color,
+      backgroundColor: color + "33", tension: 0.3
+    }]},
+    options: { responsive: true, animation: false, scales: { y: { beginAtZero: true } } }
+  });
+}
+
+const coChart = createChart("coChart", "CO (ppm)", "co", "lime");
+const otherChart = createChart("otherChart", "Other Gases", "other", "orange");
+
+function updateCard(id, value, threshold) {
+  const el = document.getElementById(id);
+  el.textContent = value.toFixed(2);
+  el.className = value > threshold
+    ? "text-4xl font-bold mt-4 text-red-500"
+    : "text-4xl font-bold mt-4 text-green-400";
+}
+
+function calculateAQI(co, other) {
+  return (0.6 * co) + (0.4 * other);
+}
+
+const activeViolationKey = `pucheck_active_violation_${vehicleNumber}`;
+function readPreviousViolationState() {
+  try { return localStorage.getItem(activeViolationKey) === "true"; }
+  catch (error) { console.warn("localStorage unavailable; duplicate prevention lasts only for this page session.", error); return false; }
+}
+function storeViolationState(value) {
+  try { localStorage.setItem(activeViolationKey, String(value)); }
+  catch (error) { console.warn("Could not persist violation state in this browser.", error); }
+}
+let wasViolation = readPreviousViolationState();
+
+function timestampToDate(value) {
+  if (!value) return null;
+  if (typeof value.toDate === "function") return value.toDate();
+  if (typeof value === "string" || typeof value === "number") {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+  return null;
+}
+
+function renderLog(log) {
+  const row = document.createElement("tr");
+  row.className = "border-b border-slate-700";
+
+  const date = timestampToDate(log.timestamp);
+  const values = [
+    date ? date.toLocaleString() : "Time unavailable",
+    log.parameter || "Emission Threshold",
+    `CO: ${Number(log.co ?? 0).toFixed(2)} ppm | Other: ${Number(log.other ?? 0).toFixed(2)} | AQI: ${Number(log.aqi ?? 0).toFixed(2)}`,
+    log.status || "VIOLATED"
+  ];
+
+  values.forEach((value, index) => {
+    const cell = document.createElement("td");
+    cell.className = index === 3 ? "p-2 text-red-400" : "p-2";
+    cell.textContent = value;
+    row.appendChild(cell);
+  });
+  return row;
+}
+
+function startFirestoreListener(firestore) {
+  const logsRef = collection(firestore, "violation_logs");
+
+  // Sort client-side so manually added documents without timestamp remain visible.
+  onSnapshot(logsRef, snapshot => {
+    const records = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    records.sort((a, b) =>
+      (timestampToDate(b.timestamp)?.getTime() ?? 0) -
+      (timestampToDate(a.timestamp)?.getTime() ?? 0)
+    );
+
+    logTable.replaceChildren();
+    if (records.length === 0) {
+      const row = document.createElement("tr");
+      const cell = document.createElement("td");
+      cell.colSpan = 4;
+      cell.className = "p-3 text-slate-400";
+      cell.textContent = "No violation records saved yet.";
+      row.appendChild(cell);
+      logTable.appendChild(row);
+    } else {
+      records.slice(0, 100).forEach(record => logTable.appendChild(renderLog(record)));
+    }
+    logStatus.textContent = `${records.length} saved record(s)`;
+    logStatus.className = "text-sm text-slate-400";
+  }, error => {
+    console.error("Firestore history listener failed:", error);
+    logStatus.textContent = "Could not load logs. Check Firestore rules and connection.";
+    logStatus.className = "text-sm text-red-400";
+  });
+}
+
+async function saveViolationLog(firestore, co, other, aqi) {
+  try {
+    await addDoc(collection(firestore, "violation_logs"), {
+      vehicleNumber,
+      parameter: "Emission Threshold",
+      co, other, aqi,
+      status: "VIOLATED",
+      timestamp: serverTimestamp()
+    });
+    console.info("Violation successfully saved to Cloud Firestore.");
+  } catch (error) {
+    console.error("Failed to save violation to Cloud Firestore:", error);
+    setConnectionMessage("Could not save violation. Check Firestore rules.", "text-red-400");
+  }
+}
+
+try {
+  const app = initializeApp(firebaseConfig);
+  const realtimeDb = getDatabase(app);
+  const firestore = getFirestore(app);
+
+  startFirestoreListener(firestore);
+
+  const vehicleRef = ref(realtimeDb, `vehicles/${vehicleNumber}/latest`);
+
+  onValue(vehicleRef, snapshot => {
+    const data = snapshot.val();
+
+    if (!data) {
+      setWaiting(`Firebase connected. Waiting for sensor data from ${vehicleNumber}.`);
+      return;
+    }
+
+    const co = Number(data.co);
+    const other = Number(data.other);
+
+    if (!Number.isFinite(co) || !Number.isFinite(other)) {
+      setWaiting("Sensor data received, but CO/other values are invalid.");
+      console.error("Invalid sensor data received:", data);
+      return;
+    }
+
+    const aqi = calculateAQI(co, other);
+    updateCard("co", co, thresholds.co);
+    updateCard("other", other, thresholds.other);
+    updateCard("aqi", aqi, thresholds.aqi);
+
+    const violation = co > thresholds.co || other > thresholds.other || aqi > thresholds.aqi;
+    const status = document.getElementById("status");
+    status.textContent = violation ? "VIOLATED" : "COMPLIANT";
+    status.className = violation
+      ? "text-4xl font-bold mt-6 text-red-500 animate-pulse"
+      : "text-4xl font-bold mt-6 text-green-400";
+
+    setConnectionMessage(`Connected to Firebase • Vehicle: ${vehicleNumber}`, "text-green-400");
+
+    // Save one record when readings transition from compliant to violated.
+    if (violation && !wasViolation) saveViolationLog(firestore, co, other, aqi);
+    wasViolation = violation;
+    storeViolationState(wasViolation);
+
+    history.time.push(new Date().toLocaleTimeString());
+    history.co.push(co);
+    history.other.push(other);
+    if (history.time.length > 50) {
+      history.time.shift();
+      history.co.shift();
+      history.other.shift();
+    }
+    coChart.update();
+    otherChart.update();
+  }, error => {
+    console.error("Realtime Database listener failed:", error);
+    setWaiting("Could not read sensor data. Check Realtime Database URL and rules.");
+    setConnectionMessage("Realtime Database read error.", "text-red-400");
+  });
+
+} catch (error) {
+  console.error("Firebase initialization failed:", error);
+  setWaiting("Firebase initialization failed. Check configuration and browser console.");
+  setConnectionMessage("Firebase initialization error.", "text-red-400");
+}
+</script>
+
+<style>
+.card {
+  background-color: #1e293b;
+  padding: 24px;
+  border-radius: 16px;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.3);
+}
+.card h2 { color: #94a3b8; }
+.card p {
+  font-size: 2.2rem;
+  font-weight: bold;
+  margin-top: 10px;
+}
+</style>
+</body>
+</html>
